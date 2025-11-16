@@ -1,0 +1,1102 @@
+{
+  "name": "SwipeWise Agent Brain",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Page-visit classifier \nThis workflow receives every browser page visit from the extension.\nIt determines if the page is:\n\t•\tnon_shopping\n\t•\tshopping\n\t•\tcheckout\n\t•\tad\n\nIt also decides whether to show a gentle behavioral nudge (reflection message).",
+        "height": 416,
+        "width": 1616,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -848,
+        2144
+      ],
+      "typeVersion": 1,
+      "id": "ed828692-91a7-4086-800e-4f2b84a3b786",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "spendguard-agent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -256,
+        2304
+      ],
+      "id": "5c9b5232-5b77-44b4-bd08-da0fc2853a3a",
+      "name": "Webhook – Classify Page Visit",
+      "webhookId": "f359ff2b-5968-49a6-80bb-dcfcdfc40b42"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a financial behavior monitoring assistant.\n\nYour job is to classify any webpage visit into:\n- \"non_shopping\": general browsing, news, social media, blogs, search engines.\n- \"shopping\": product pages, category pages, special offers, e-commerce homepages.\n- \"checkout\": cart, checkout, payment, order confirmation, subscription pages.\n- \"ad\": promotional or tracked ad click events.\n\nYou must ALWAYS return ONLY valid JSON (no markdown), in EXACTLY this structure:\n\n{\n  \"page_type\": \"non_shopping\" | \"shopping\" | \"checkout\" | \"ad\",\n  \"category\": \"electronics\" | \"fashion\" | \"groceries\" | \"general\" | null,\n  \"risk_level\": \"low\" | \"medium\" | \"high\",\n  \"should_nudge\": true | false,\n  \"message\": \"short helpful nudge or empty string\"\n}\n\nSTRONG URL RULES (very important):\n\n- If the URL hostname contains any of:\n  - \"amazon.\", \"ebay.\", \"aliexpress.\", \"zalando.\", \"gigantti.\", \"verkkokauppa.\", \"prisma.fi\", \"power.fi\"\n  AND the path contains product or cart patterns like:\n  - \"/dp/\", \"/gp/product\", \"/gp/cart\", \"/cart\", \"/basket\", \"/product\", \"/item\"\n  THEN:\n  - If it looks like a cart, checkout or payment page → set \"page_type\": \"checkout\" and \"should_nudge\": true.\n  - Otherwise → set \"page_type\": \"shopping\" and \"should_nudge\": true.\n\n- If event = \"payment_page\" → \"page_type\": \"checkout\" and \"should_nudge\": true.\n- If event = \"ad_click\" → \"page_type\": \"ad\". Set \"should_nudge\": true only if the URL clearly leads to a purchase, signup, or subscription page.\n- If the URL contains cart/checkout/payment keywords (for example: \"cart\", \"checkout\", \"payment\", \"order\", \"pay\") → treat it as \"checkout\" and set \"should_nudge\": true.\n- If the domain is not clearly shopping and the URL does not look like product/checkout → \"page_type\": \"non_shopping\" and \"should_nudge\": false.\n- If you are uncertain → default to:\n\n{\n  \"page_type\": \"non_shopping\",\n  \"category\": null,\n  \"risk_level\": \"low\",\n  \"should_nudge\": false,\n  \"message\": \"\"\n}\n\nNudging rules:\n\n- When \"should_nudge\" = false:\n  - \"message\" MUST be an empty string \"\".\n- When \"should_nudge\" = true:\n  - \"message\" should be a very short, calm reflection nudge (max 1–2 short sentences).\n  - No financial advice, no telling the user what to do, no shame or guilt.\n\nYou are not allowed to give financial advice or say what the user *should* do.\n\nClassify this webpage:\n\nEvent: {{$json.event}}\nURL: {{$json.url}}\nTimestamp: {{$json.timestamp}}\nTitle: {{$json.title || \"unknown\"}}\n\nReturn ONLY the JSON in the structure above.",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are a financial behavior monitoring assistant."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        -32,
+        2192
+      ],
+      "id": "36809e71-ad29-4d5b-901a-b407268ead61",
+      "name": "LLM – Classify Page Visit"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        32,
+        2416
+      ],
+      "id": "b3ea4988-4acc-40d5-b3b5-5c9a8fc082e3",
+      "name": "Language Model – Page Classifier",
+      "credentials": {
+        "openAiApi": {
+          "id": "PQwogquGqqr5QT9y",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse LLM output into clean JSON classification\n// and apply deterministic overrides for obvious shopping domains.\n\nconst modelItem = $json || {};\n\n// 1) If the LLM failed, it may put an error object here\nif (modelItem.error) {\n  return [\n    {\n      json: {\n        page_type: \"non_shopping\",\n        category: null,\n        risk_level: \"low\",\n        should_nudge: false,\n        message: \"\",\n        originalUrl: \"\",\n        originalEvent: \"site_visit\",\n      },\n    },\n  ];\n}\n\n// 2) Get the raw text from LLM (OpenAI/Gemini style)\nlet text = \"\";\ntry {\n  if (modelItem.content?.parts?.[0]?.text) {\n    text = modelItem.content.parts[0].text;\n  } else if (typeof modelItem.text === \"string\") {\n    text = modelItem.text;\n  } else {\n    text = \"\";\n  }\n} catch (e) {\n  text = \"\";\n}\n\n// 3) Extract JSON\nlet jsonString = \"\";\nconst match = String(text).match(/\\{[\\s\\S]*\\}/);\nif (match && match[0]) {\n  jsonString = match[0];\n} else {\n  jsonString = String(text || \"\").trim();\n}\n\n// 4) Parse or fallback\nlet parsed;\ntry {\n  parsed = JSON.parse(jsonString);\n} catch (e) {\n  parsed = {\n    page_type: \"non_shopping\",\n    category: null,\n    risk_level: \"medium\",\n    should_nudge: false,\n    message: \"\",\n  };\n}\n\n// 5) Normalize & defaults\nif (!parsed.page_type) parsed.page_type = \"non_shopping\";\nif (typeof parsed.category === \"undefined\") parsed.category = null;\nif (![\"low\", \"medium\", \"high\"].includes(parsed.risk_level)) {\n  parsed.risk_level = \"medium\";\n}\nif (typeof parsed.should_nudge !== \"boolean\") parsed.should_nudge = false;\nif (typeof parsed.message !== \"string\") parsed.message = \"\";\n\n// 6) Get original request from Webhook\nlet original = {};\ntry {\n  const hookItems = $items(\"Webhook – Classify Page Visit\", 0, 0);\n  if (hookItems && hookItems[0] && hookItems[0].json) {\n    original = hookItems[0].json;\n  }\n} catch (e) {\n  original = {};\n}\n\nconst url = String(original.url || \"\").toLowerCase();\nconst event = original.event || \"site_visit\";\n\n// 7) Deterministic shopping overrides\nconst shoppingHosts = [\n  \"amazon.\",\n  \"ebay.\",\n  \"aliexpress.\",\n  \"zalando.\",\n  \"gigantti.\",\n  \"verkkokauppa.\",\n  \"prisma.fi\",\n  \"power.fi\",\n];\n\nconst isKnownShop = shoppingHosts.some((h) => url.includes(h));\nconst looksLikeCheckout =\n  url.includes(\"cart\") ||\n  url.includes(\"checkout\") ||\n  url.includes(\"payment\") ||\n  url.includes(\"order\") ||\n  url.includes(\"pay\");\n\nif (isKnownShop) {\n  if (event === \"payment_page\" || looksLikeCheckout) {\n    parsed.page_type = \"checkout\";\n  } else {\n    parsed.page_type = \"shopping\";\n  }\n  parsed.should_nudge = true;\n\n  if (!parsed.message || !parsed.message.trim()) {\n    parsed.message = \"Take a moment to reflect before buying this.\";\n  }\n}\n\n// carry original info for Build Response\nparsed.originalUrl = original.url || \"\";\nparsed.originalEvent = original.event || \"site_visit\";\n\n// 8) Return\nreturn [\n  {\n    json: parsed,\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        2304
+      ],
+      "id": "a5f1bbfc-a3b7-4961-977e-49cb24a35650",
+      "name": "Normalize Page Classification"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Response (final output to the browser extension)\n\n// Base classification from previous Code node\nconst base = $json || {};\n\nlet safeBase = {\n  page_type: base.page_type || \"non_shopping\",\n  risk_level: base.risk_level || \"low\",\n  should_nudge:\n    typeof base.should_nudge === \"boolean\" ? base.should_nudge : false,\n  message:\n    typeof base.message === \"string\" && base.message.trim()\n      ? base.message.trim()\n      : \"\",\n};\n\n// Use the original URL + event carried from previous Code node\nconst url = String(base.originalUrl || \"\").toLowerCase();\nconst event = base.originalEvent || \"site_visit\";\n\nconst shoppingHosts = [\n  \"amazon.\",\n  \"ebay.\",\n  \"aliexpress.\",\n  \"zalando.\",\n  \"gigantti.\",\n  \"verkkokauppa.\",\n  \"prisma.fi\",\n  \"power.fi\",\n];\n\nconst isKnownShop = shoppingHosts.some((h) => url.includes(h));\nconst looksLikeCheckout =\n  url.includes(\"cart\") ||\n  url.includes(\"checkout\") ||\n  url.includes(\"payment\") ||\n  url.includes(\"order\") ||\n  url.includes(\"pay\");\n\nif (isKnownShop) {\n  if (event === \"payment_page\" || looksLikeCheckout) {\n    safeBase.page_type = \"checkout\";\n  } else {\n    safeBase.page_type = \"shopping\";\n  }\n\n  // On known shopping sites we ALWAYS allow nudging\n  safeBase.should_nudge = true;\n\n  if (!safeBase.message || !safeBase.message.trim()) {\n    safeBase.message =\n      \"Take a moment to check if this fits your budget and priorities.\";\n  }\n}\n\nif (typeof safeBase.message !== \"string\") {\n  safeBase.message = \"\";\n}\n\nreturn [\n  {\n    json: {\n      message: safeBase.message,\n      page_type: safeBase.page_type,\n      risk_level: safeBase.risk_level,\n      should_nudge: safeBase.should_nudge,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        2304
+      ],
+      "id": "feaf58b0-e2a0-4602-a424-73c8c08ec2dc",
+      "name": "Build Classifier Response"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "smart-purchase-nudge",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -256,
+        2736
+      ],
+      "id": "4b6e2766-4132-4a56-81a4-17d1fe75eabc",
+      "name": "Webhook – Smart Purchase Nudge (API)",
+      "webhookId": "f715a0ee-38c6-476c-bcde-4b934f2d9922"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Works whether the data is under `body` or as root JSON\n\nconst src = $json.body ?? $json;\n\nconst url = src.url || \"\";\nconst title = src.title || \"unknown offer\";\nconst price = Number(src.price ?? 0);\nconst cartTotal = Number(src.cartTotal ?? 0);\nconst monthlyBudget = Number(src.monthlyBudget ?? 0);\n\n// Text description that we will feed to the LLM\nconst offerText = `\nURL: ${url}\nTitle: ${title}\nVisible price: ${price || \"unknown\"}\nCart total: ${cartTotal || \"unknown\"}\nUser monthly budget: ${monthlyBudget || \"unknown\"}\n`.trim();\n\nreturn [\n  {\n    json: {\n      url,\n      title,\n      price,\n      cartTotal,\n      monthlyBudget,\n      offerText,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        2736
+      ],
+      "id": "7cfa56eb-f894-4141-9cd3-3340696c0f37",
+      "name": "Prepare Offer Text For LLM"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a financial offer risk analyzer for young Finnish consumers.\n\nYour task:\n- Read the TEXT DESCRIPTION of a financial offer (loan, credit card, pay-later scheme, subscription, financing plan, etc.).\n- Help the user understand risks, trade-offs, and smarter options in clear, simple language.\n- Encourage reflection, not action. You MUST NOT give direct financial advice (e.g. \"You should take this\" / \"You should not take this\").\n\nContext:\n- Audience: young people in Finland (e.g. students, first job, first credit products).\n- Consider traditional financial literacy skills:\n  - Budgeting, saving, debt management, interest on interest, total cost over time.\n- Consider digital-age challenges:\n  - Algorithmic targeting, nudges, gamified apps, “0% interest” or “buy now, pay later” offers, urgency, limited-time promos.\n- Consider Finnish context:\n  - Typical Finnish banks (Nordea, OP, S-Pankki, Danske Bank, etc.)\n  - Consumer protection and comparison services\n  - Common online comparison tools and licensing checks.\n\nYour job is to:\n1) Classify the overall verdict of the offer.\n2) Summarize the key reasoning in 2–3 sentences.\n3) List the most important pros/cons as short bullet points.\n4) Highlight any likely hidden costs or long-term risks.\n5) Suggest specific alternative actions or comparison steps a user in Finland could take.\n6) Provide one short, calm “advice” sentence suitable for a small banner in a browser extension.\n7) Optionally list any “marketing tricks” used in the offer (e.g. urgency, dark patterns, gamification, “0% but with fees”).\n\nVERY IMPORTANT:\n- Be neutral, educational, and calm.\n- No shame, blame, or fear-mongering.\n- No direct recommendations like “take it / don’t take it”.\n- Focus on helping the user pause, understand, and compare.\n\nYou will receive the offer as plain text:\n\n{{$json.offerText}}\n\nOUTPUT FORMAT (STRICT):\nYou MUST return ONLY valid JSON (no markdown, no extra text) with EXACTLY this shape:\n\n{\n  \"verdict\": \"good\" | \"bad\" | \"caution\",\n  \"title\": \"short title for the verdict\",\n  \"summary\": \"2–3 sentences explaining the assessment in plain language, linking to financial literacy skills and digital-age risks.\",\n  \"keyPoints\": [\n    \"bullet point 1 (short, concrete)\",\n    \"bullet point 2\",\n    \"bullet point 3\",\n    \"bullet point 4\"\n  ],\n  \"hiddenCosts\": [\n    \"hidden cost or long-term risk 1 (if none, say: 'No obvious hidden costs identified, but always check the full terms.')\"\n  ],\n  \"alternatives\": [\n    \"specific actionable alternative 1, e.g. 'Compare this product on a Finnish loan comparison site before deciding.'\",\n    \"specific actionable alternative 2, e.g. 'Check if your own bank (Nordea, OP, S-Pankki, Danske Bank) offers a simpler or cheaper option.'\",\n    \"specific actionable alternative 3, e.g. 'Consider waiting and saving instead of using high-cost credit if your budget is tight.'\"\n  ],\n  \"advice\": \"1–2 sentence calm reflection nudge that would fit in a small banner, encouraging the user to pause, check the total cost, and compare options.\",\n  \"marketingTricks\": [\n    \"description of marketing trick 1, e.g. 'Highlights 0% interest but hides fees in fine print.'\",\n    \"description of marketing trick 2 (if any)\"\n  ],\n  \"recommendation\": \"A SHORT ALL-CAPS summary line for UI, e.g. 'CHECK THE REAL COST BEFORE ACCEPTING' or 'COMPARE WITH OTHER OFFERS FIRST'.\"\n}\n\nRules:\n- If you cannot identify hidden costs, use a clear explanation in the first element of hiddenCosts.\n- If you are unsure about some details, mention the uncertainty in the summary.\n- Do NOT include any text outside the JSON object.",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are a financial offer risk analyzer for young Finnish consumers."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        192,
+        2624
+      ],
+      "id": "0d65b618-f65c-43e9-836c-329f21ab7eb8",
+      "name": "LLM – Analyze Offer Risk"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "chatgpt-4o-latest",
+          "mode": "list",
+          "cachedResultName": "chatgpt-4o-latest"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        192,
+        2832
+      ],
+      "id": "49af3a3d-aad8-48a6-9c4e-24bce0032639",
+      "name": "Language Model – Offer Analyzer",
+      "credentials": {
+        "openAiApi": {
+          "id": "PQwogquGqqr5QT9y",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// LLM output typically looks like:\n// { content: { parts: [ { text: \"...json...\" } ], role: \"model\" }, ... }\n\nconst item = $json || {};\n\nlet rawText = \"\";\n\n// 1) Try to read the text from the LLM node\ntry {\n  if (item.content?.parts?.[0]?.text) {\n    rawText = item.content.parts[0].text;\n  } else if (typeof item.text === \"string\") {\n    rawText = item.text;\n  }\n} catch (e) {\n  rawText = \"\";\n}\n\nrawText = String(rawText || \"\").trim();\n\n// 2) Clean common wrappers: ```json ... ```\nlet cleaned = rawText\n  .replace(/```json/gi, \"\")\n  .replace(/```/g, \"\")\n  .trim();\n\n// 3) Extract JSON between first '{' and last '}'\nlet jsonString = \"\";\nconst match = cleaned.match(/\\{[\\s\\S]*\\}/);\nif (match && match[0]) {\n  jsonString = match[0];\n} else {\n  jsonString = cleaned;\n}\n\nlet analysis;\n\n// 4) Try to parse JSON, otherwise fallback\ntry {\n  analysis = JSON.parse(jsonString);\n} catch (e) {\n  // Fallback when JSON is broken or it's not a real financial offer\n  analysis = {\n    verdict: \"caution\",\n    title: \"Could not fully analyze this offer\",\n    summary:\n      \"This looks like a regular purchase or incomplete financial offer. Focus on your monthly budget and compare with other Finnish providers if needed.\",\n    recommendation: \"CHECK YOUR BUDGET BEFORE DECIDING\",\n  };\n}\n\n// 5) Normalize fields\nconst verdict = analysis.verdict || \"caution\";\nconst title = analysis.title || \"\";\nconst summary = analysis.summary || \"\";\nconst recommendation = analysis.recommendation || \"\";\n\n// 6) Build a SHORT banner text based on verdict + recommendation/summary\nlet banner = \"\";\n\nif (recommendation) {\n  const firstSentence = recommendation.split(/[.!?]/)[0].trim();\n  const firstSummarySentence = summary.split(/[.!?]/)[0].trim();\n  banner = firstSummarySentence\n    ? `${firstSentence}. ${firstSummarySentence}.`\n    : `${firstSentence}.`;\n} else if (verdict === \"bad\") {\n  banner =\n    \"This offer looks risky. Check the real cost and compare with other Finnish providers before accepting.\";\n} else if (verdict === \"good\") {\n  banner =\n    \"This offer looks generally reasonable, but make sure it still fits your budget and priorities.\";\n} else {\n  banner =\n    \"This offer may have trade-offs. Read the details carefully and compare alternatives before accepting.\";\n}\n\n// 7) Final safety fallback\nif (!banner.trim()) {\n  banner =\n    \"Before you accept this offer or purchase, take a moment to check the true cost and compare alternatives.\";\n}\n\n// 8) Return exactly what the extension expects\nreturn [\n  {\n    json: {\n      message: analysis.advice || banner,\n      verdict,\n      title,\n      summary,\n      recommendation,\n      rawAnalysis: analysis,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        2736
+      ],
+      "id": "d1763278-89d5-4b3d-9856-70f50988e9b9",
+      "name": "Format Offer Analysis For Extension"
+    },
+    {
+      "parameters": {
+        "path": "swipewise-deal-view",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -464,
+        3216
+      ],
+      "id": "355b7579-3251-4611-8c93-58baeadde93f",
+      "name": "Webhook – SwipeWise Deal View (HTML)",
+      "webhookId": "1d69360b-8daf-40b7-8d05-e5bb988b5487"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Works for GET query params\nconst query = $json.query || {};\n\nconst url = query.url || \"\";\nconst price = Number(query.price ?? 0);\nconst cartTotal = Number(query.cartTotal ?? 0);\nconst monthlyBudget = Number(query.monthlyBudget ?? 0);\nconst title = (query.title || \"\").toString();\n\nreturn [\n  {\n    json: {\n      url,\n      title,\n      price,\n      cartTotal,\n      monthlyBudget,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        3216
+      ],
+      "id": "45cd6c20-83d7-4e8c-bfd7-8c619b842f19",
+      "name": "Parse Query Params → Offer"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://mghackaton.app.n8n.cloud/webhook/smart-purchase-nudge",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -16,
+        3216
+      ],
+      "id": "a18c2c6d-6eda-4af2-b87f-2b1a1f0fe13d",
+      "name": "Call Smart Purchase Nudge API"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Map Analysis for View\"\n\nconst data = $json || {};\nconst raw = data.rawAnalysis || {};\n\nconst marketingDescriptions = (raw.marketingTricks || []).map((t) => {\n  if (typeof t === \"string\") return t;\n  if (t && typeof t.description === \"string\") return t.description;\n  return \"\";\n}).filter(Boolean);\n\nreturn [\n  {\n    json: {\n      verdict: data.verdict || \"caution\",\n      banner: data.message || data.recommendation || \"\",\n      title: data.title || \"Offer analysis\",\n      summary: data.summary || \"\",\n\n      keyPoints: raw.keyPoints || [],\n      hiddenCosts: raw.hiddenCosts || [],\n      smarterOptions: raw.alternatives || [],\n      marketingTricks: marketingDescriptions,\n\n      // ⬅️ ADD THIS\n      advice: raw.advice || \"\",\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        3216
+      ],
+      "id": "6c45cbab-754a-41b1-a925-94a67183bc11",
+      "name": "Map Offer Analysis → View Model"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node name: \"Render HTML\"\n\nconst {\nverdict = \"caution\",\nbanner = \"\",\ntitle = \"Offer analysis\",\nsummary = \"\",\nkeyPoints = [],\nhiddenCosts = [],\nsmarterOptions = [],\nmarketingTricks = [],\nadvice = \"\",\n} = $json;\n\n// Utility: make <li> list or fallback text\n    function renderList(items, emptyText) {\n    if (!Array.isArray(items) || items.length === 0) {\n    return `<p class=\"swp-empty\">${emptyText}</p>`;\n    }\n\n    const li = items\n    .filter((x) => typeof x === \"string\" && x.trim())\n    .map((x) => `\n<li>${x.trim()}</li>`)\n.join(\"\");\n\nif (!li) {\nreturn `<p class=\"swp-empty\">${emptyText}</p>`;\n}\n\nreturn `<ul class=\"swp-list\">${li}</ul>`;\n}\n\nconst verdictLabel = verdict.toUpperCase() || \"CAUTION\";\n\n// Choose what text to show in the banner\n// Choose advice text or fallback\nconst fullAdvice =\n  advice ||\n  banner ||\n  summary ||\n  \"This offer may have trade-offs. Read the details carefully and compare alternatives before accepting.\";\n\n// Extract ONLY the first sentence\nlet firstSentence = fullAdvice;\nconst match = fullAdvice.match(/(.+?[.!?])\\s/);\nif (match) {\n  firstSentence = match[1];\n}\n\n// Split into first sentence (bold) + rest (normal)\nlet primarySentence = fullAdvice;\nlet restText = \"\";\n\n// Build HTML\nconst html = `\n<!DOCTYPE html>\n<html lang=\"en\">\n\n<head>\n    <meta charset=\"UTF-8\" />\n    <title>SwipeWise – Deal Analysis</title>\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\" />\n    <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin />\n    <link href=\"https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap\"\n        rel=\"stylesheet\" />\n    <style>\n        :root {\n            --background: #ffffff;\n            --foreground: #050315;\n            --card: #ffffff;\n            --card-foreground: #050315;\n            --muted: #ececf0;\n            --muted-foreground: #717182;\n            --accent: #e9ebef;\n            --accent-foreground: #030213;\n            --border: rgba(0, 0, 0, 0.08);\n            --primary: #030213;\n            --primary-foreground: #ffffff;\n            --radius-lg: 10px;\n        }\n\n        * {\n            box-sizing: border-box;\n            margin: 0;\n            padding: 0;\n        }\n\n        html,\n        body {\n            height: 100%;\n        }\n\n        body {\n            font-family: \"Plus Jakarta Sans\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n            background: linear-gradient(to bottom right,\n                    rgb(147, 51, 234),\n                    rgb(236, 72, 153),\n                    rgb(251, 146, 60));\n            color: var(--foreground);\n            display: flex;\n            align-items: stretch;\n            justify-content: center;\n            padding: 24px 12px;\n        }\n\n        .swp-shell {\n            width: 100%;\n            max-width: 960px;\n            margin: auto;\n        }\n\n        .swp-card {\n            background: var(--card);\n            color: var(--card-foreground);\n            border-radius: 1.25rem;\n            border: 1px solid var(--border);\n            box-shadow:\n                0 24px 80px rgba(15, 23, 42, 0.35),\n                0 0 0 1px rgba(255, 255, 255, 0.15);\n            padding: 20px 18px 22px;\n        }\n\n        @media (min-width: 768px) {\n            .swp-card {\n                padding: 24px 24px 26px;\n            }\n        }\n\n        .swp-header {\n            display: flex;\n            justify-content: space-between;\n            gap: 12px;\n            margin-bottom: 16px;\n        }\n\n        .swp-header-left {\n            display: flex;\n            align-items: center;\n            gap: 10px;\n        }\n\n        .swp-logo-img {\n            width: 40px;\n            height: 40px;\n            border-radius: 12px;\n            /* optional */\n        }\n\n        .swp-header-text-title {\n            font-size: 1.25rem;\n            font-weight: 800;\n            letter-spacing: -0.03em;\n            color: #050315;\n        }\n\n        .swp-header-text-sub {\n            font-size: 0.8rem;\n            color: #4b5563;\n            font-weight: 600;\n        }\n\n        .swp-header-score {\n            padding: 10px 12px;\n            border-radius: 0.9rem;\n            border: 1px solid rgba(148, 163, 184, 0.5);\n            background: rgba(249, 250, 251, 0.85);\n            text-align: right;\n            min-width: 120px;\n        }\n\n        .swp-header-score-label {\n            font-size: 0.7rem;\n            text-transform: uppercase;\n            letter-spacing: 0.15em;\n            color: #6b7280;\n            font-weight: 700;\n        }\n\n        .swp-header-score-value {\n            font-size: 0.9rem;\n            font-weight: 700;\n            color: #111827;\n            margin-top: 2px;\n        }\n\n        .swp-pill-row {\n            display: flex;\n            align-items: center;\n            gap: 8px;\n            margin-bottom: 10px;\n            margin-top: 4px;\n        }\n\n        .swp-pill {\n            display: inline-flex;\n            align-items: center;\n            gap: 8px;\n            padding: 4px 10px;\n            border-radius: 999px;\n            background: #0f172a;\n            color: #e5e7eb;\n            font-size: 0.7rem;\n            letter-spacing: 0.18em;\n            text-transform: uppercase;\n            border: 1px solid rgba(148, 163, 184, 0.6);\n        }\n\n        .swp-pill-dot {\n            width: 8px;\n            height: 8px;\n            border-radius: 999px;\n            background: #fbbf24;\n            box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.35);\n        }\n\n        .swp-title {\n            font-size: 1.35rem;\n            margin-top: 2px;\n            margin-bottom: 10px;\n            font-weight: 800;\n            letter-spacing: -0.02em;\n            color: #030712;\n        }\n\n        .swp-banner {\n            margin-bottom: 18px;\n            border-radius: 0.9rem;\n            background: rgb(242, 242, 242);\n            color: #f9fafb;\n            padding: 10px 12px;\n            font-size: 0.85rem;\n            line-height: 1.5;\n            border: 1px solid rgba(15, 23, 42, 0.9);\n        }\n\n        .swp-banner-strong {\n            font-weight: 700;\n            color: #050505;\n        }\n\n        .swp-banner-secondary {\n            display: block;\n            margin-top: 4px;\n            color: #050505;\n            font-weight: 500;\n        }\n\n        .swp-grid {\n            display: grid;\n            grid-template-columns: repeat(1, minmax(0, 1fr));\n            gap: 12px;\n        }\n\n        @media (min-width: 768px) {\n            .swp-grid {\n                grid-template-columns: repeat(2, minmax(0, 1fr));\n            }\n        }\n\n        .swp-box {\n            border-radius: 1rem;\n            border: 1px solid rgba(226, 232, 240, 0.9);\n            background: #f9fafb;\n            padding: 12px 14px;\n        }\n\n        .swp-box-title {\n            font-size: 0.7rem;\n            text-transform: uppercase;\n            letter-spacing: 0.19em;\n            color: #6b7280;\n            font-weight: 700;\n            margin-bottom: 2px;\n        }\n\n        .swp-box-sub {\n            font-size: 0.75rem;\n            color: #9ca3af;\n            margin-bottom: 8px;\n            font-weight: 500;\n        }\n\n        .swp-list {\n            padding-left: 18px;\n            display: grid;\n            gap: 4px;\n            font-size: 0.85rem;\n            color: #111827;\n        }\n\n        .swp-list li {\n            line-height: 1.45;\n        }\n\n        .swp-empty {\n            font-size: 0.85rem;\n            color: #9ca3af;\n        }\n\n        .swp-footer-note {\n            margin-top: 16px;\n            font-size: 0.7rem;\n            color: #6b7280;\n        }\n\n        .swp-cta-wrapper {\n            margin: 22px 0;\n            display: flex;\n            justify-content: center;\n        }\n\n        .swp-cta-button {\n            display: inline-block;\n            background: #030213;\n            color: #ffffff;\n            padding: 12px 22px;\n            border-radius: 12px;\n            font-size: 0.9rem;\n            font-weight: 700;\n            text-decoration: none;\n            border: 2px solid rgba(255, 255, 255, 0.3);\n            transition: all 0.2s ease;\n        }\n\n        .swp-cta-button:hover {\n            background: #1e1b4b;\n            border-color: rgba(255, 255, 255, 0.55);\n            transform: translateY(-2px);\n        }\n\n        .swp-cta-button:active {\n            transform: translateY(0);\n        }\n    </style>\n</head>\n\n<body>\n    <div class=\"swp-shell\">\n        <div class=\"swp-card\">\n            <header class=\"swp-header\">\n                <div class=\"swp-header-left\">\n\n                    <div>\n                        <div class=\"swp-header-text-title\">SwipeWise</div>\n                        <div class=\"swp-header-text-sub\">Think fast, spend smart.</div>\n                    </div>\n                </div>\n              \n            </header>\n\n            <div class=\"swp-pill-row\">\n                <div class=\"swp-pill\">\n                    <span class=\"swp-pill-dot\"></span>\n                    <span>${verdictLabel}</span>\n                </div>\n            </div>\n\n            <h1 class=\"swp-title\">${title}</h1>\n\n                  <div class=\"swp-banner\">\n  <span class=\"swp-banner-strong\">${firstSentence}</span>\n</div>\n\n            <div class=\"swp-cta-wrapper\">\n                <a href=\"https://core-gift-84855372.figma.site\"\n                    class=\"swp-cta-button\">\n                    Check More\n                </a>\n            </div>\n\n            <p class=\"swp-footer-note\">\n                SwipeWise does not give financial advice. This view is for education and reflection only.\n                Always double-check details on the provider's official website or with your bank.\n            </p>\n        </div>\n    </div>\n</body>\n\n</html>`;\n\n\nreturn [\n  {\n    html, \n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        3216
+      ],
+      "id": "a2d7ac87-148d-48d2-88e5-30b43eacbda4",
+      "name": "Render SwipeWise HTML Card"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{$json[\"html\"]}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        656,
+        3216
+      ],
+      "id": "28fcbbca-40ef-4d1b-be51-f567a2cfa7e9",
+      "name": "Respond With HTML"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ad-card-llm",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -400,
+        3616
+      ],
+      "id": "b74c32ed-a5e7-4003-b88b-d359db835f0f",
+      "name": "Webhook – Generate Ad Creative",
+      "webhookId": "b77969f9-337f-4793-b1ac-cd26a79d8ce1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are given the following ad inputs as JSON:\n\n{\n  \"title\": \"{{$json.title}}\",\n  \"subtitle\": \"{{$json.subtitle}}\",\n  \"terms\": {{$json.terms || []}},\n  \"brandMood\": \"{{$json.brandMood || \"modern, friendly\"}}\"\n}\n\nUsing these inputs, generate ONLY valid JSON in this shape:\n\n{\n  \"imagePrompt\": \"image prompt here\",\n  \"refinedTitle\": \"...\",\n  \"refinedSubtitle\": \"...\",\n  \"styleTags\": [\"...\"]\n}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are an expert visual designer and ad creative generator.\n\nYour job:\n- Create a visual concept for a product-focused advertisement.\n- ALWAYS generate a prompt that produces backgrounds, product shots, or abstract compositions.\n- NEVER generate people, humans, hands, faces, silhouettes, or characters.\n\nOutput ONLY valid JSON, like:\n{\n  \"imagePrompt\": \"image prompt here\",\n  \"refinedTitle\": \"...\",\n  \"refinedSubtitle\": \"...\",\n  \"styleTags\": [\"...\"]\n}\n\nStrict rules:\n- Absolutely NO people. No humans. No hands. No body parts. No silhouettes.\n- Focus on objects, products, textures, gradients, abstract environments.\n- The final image MUST be suitable as a hero banner.\n- Leave lots of negative space for text overlay.\n- No text, no logos, no watermarks.\n- Match the brand mood (colors, style)."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [
+        -176,
+        3616
+      ],
+      "id": "9587e67b-a057-4e7f-beb7-1fc7d190437f",
+      "name": "LLM – Design Ad Visual"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4.1-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -176,
+        3792
+      ],
+      "id": "b06e06ba-a854-4eec-97fd-57d7bf6f035a",
+      "name": "Language Model – Ad Designer",
+      "credentials": {
+        "openAiApi": {
+          "id": "PQwogquGqqr5QT9y",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The LLM should return a JSON string.\n// But depending on the OpenAI node version, the text might be in different fields.\n// We'll try a few common ones.\n\n// Original payload from \"Webhook – Generate Ad Creative\"\nconst original = $item(0, \"Webhook – Generate Ad Creative\").json;\n\n// Try to read the text from different possible fields\nlet raw =\n  ($json.content?.parts?.[0]?.text) ||          // LangChain-style content.parts[0].text\n  $json.text ||                                 // some nodes use \"text\"\n  $json.content ||                              // some use \"content\" as plain string\n  $json.choices?.[0]?.message?.content ||       // classic OpenAI chat format\n  '';\n\nif (typeof raw !== 'string') {\n  raw = JSON.stringify(raw);\n}\n\n// Sometimes the model wraps JSON in ```json ... ```\n// Clean that up just in case.\nraw = raw.trim();\nraw = raw\n  .replace(/^```json/i, '')\n  .replace(/^```/, '')\n  .replace(/```$/, '')\n  .trim();\n\nlet parsed;\n\ntry {\n  parsed = JSON.parse(raw);\n} catch (error) {\n  // Fallback: if parsing fails, at least don't break the workflow\n  parsed = {\n    imagePrompt:\n      'Abstract gradient background, lots of negative space, no text, no logos',\n    refinedTitle: original.title || 'Ad',\n    refinedSubtitle: original.subtitle || '',\n    styleTags: ['fallback', 'gradient', 'abstract'],\n  };\n}\n\nreturn [\n  {\n    json: parsed,\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        176,
+        3616
+      ],
+      "id": "776a9263-2f9c-4b49-a3b1-41dacd6a1b69",
+      "name": "Parse Ad Design JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Get LLM JSON from \"Parse Ad Design JSON\"\nlet llm = {};\ntry {\n  llm = $item(0, \"Parse Ad Design JSON\").json || {};\n} catch (e) {\n  llm = {};\n}\n\n// 2. Original payload from \"Webhook – Generate Ad Creative\"\nlet original = {};\ntry {\n  original = $item(0, \"Webhook – Generate Ad Creative\").json || {};\n} catch (e) {\n  original = {};\n}\n\n// 3. Image response from previous node (\"Generate an image\")\nconst imageResponse = $json || {};\nconst imageUrl = imageResponse.data?.[0]?.url || null;\n\n// Prefer refined values from LLM, but fall back to original\nconst title = llm.refinedTitle || original.title || \"Ad\";\nconst subtitle = llm.refinedSubtitle || original.subtitle || \"\";\n\nreturn [\n  {\n    json: {\n      // Final ad object your frontend will use\n      title,\n      subtitle,\n      terms: original.terms || [],\n      brandMood: original.brandMood || null,\n\n      // Extra debug/metadata if you want it\n      styleTags: llm.styleTags || [],\n      imagePrompt: llm.imagePrompt || \"\",\n\n      // The one your <AdCard> cares about:\n      image: imageUrl,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        3616
+      ],
+      "id": "4afb868d-c03b-47f5-9d26-d9a0b348ddbd",
+      "name": "Build Final Ad JSON For Frontend"
+    },
+    {
+      "parameters": {
+        "content": "## Offer Risk Analyzer \n\nThis is the deep AI analysis endpoint.\nThe extension sends the details of a financial offer, and the LLM evaluates:\n\t•\tRisk\n\t•\tSummary\n\t•\tHidden costs\n\t•\tKey points\n\t•\tAlternatives\n\t•\tActionable advice for young Finnish consumers",
+        "height": 416,
+        "width": 1616,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -848,
+        2592
+      ],
+      "typeVersion": 1,
+      "id": "3ef488ba-1ae8-4be2-9543-79dd1ba391be",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "## Rendered HTML Deal Card\nTurns a JSON financial analysis into a beautiful HTML page that the browser extension can open in a new tab.\n\nThis is the UI you saw working earlier.",
+        "height": 416,
+        "width": 1760,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -864,
+        3072
+      ],
+      "typeVersion": 1,
+      "id": "d9654350-5883-4d35-bc6f-c9188ac033a7",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "##  Ad Visual Generator \nGiven:\n\t•\ttitle\n\t•\tsubtitle\n\t•\tbrandMood\n\t•\tterms\n\nThe LLM generates:\n\t•\ta DALL·E prompt\n\t•\tstyle tags\n\t•\trefined title/subtitle\n\nThen DALL·E generates an ad hero image.",
+        "height": 416,
+        "width": 1760,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -864,
+        3552
+      ],
+      "typeVersion": 1,
+      "id": "8ab761ac-6c83-47f5-8074-8b832cb6524c",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "## SwipeWise – Eval Harness\n\nContains 3 reproducible scenarios for:\n• checkout nudge\n• non-shopping no-nudge\n• risky credit offer → caution verdict\n\nResults are aggregated into a compact metrics object\n(total, passed, failed, passRate, and per-case details).",
+        "height": 416,
+        "width": 1760,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -864,
+        4016
+      ],
+      "typeVersion": 1,
+      "id": "e5eee04c-63a7-4f05-bb0f-709508d61965",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -400,
+        4128
+      ],
+      "id": "a33ddd31-6ad8-4e63-a59c-10f81467e721",
+      "name": "Start Eval"
+    },
+    {
+      "parameters": {
+        "jsCode": "const BASE_URL = \"https://mghackaton.app.n8n.cloud\";\n\nreturn [\n  //\n  // 1) /spendguard-agent – Amazon checkout → should nudge\n  //\n  {\n    json: {\n      name: \"SpendGuard – Amazon checkout (should nudge)\",\n      endpoint: `${BASE_URL}/webhook/spendguard-agent`,\n      payload: {\n        url: \"https://www.amazon.de/gp/cart/view.html\",\n        title: \"Your Amazon Cart\",\n        event: \"site_visit\",\n        timestamp: new Date().toISOString(),\n      },\n      expected: {\n        page_type: \"checkout\",\n        should_nudge: true,\n      },\n    },\n  },\n\n  //\n  // 2) /spendguard-agent – non-shopping news page → should NOT nudge\n  //\n  {\n    json: {\n      name: \"SpendGuard – News page (no nudge)\",\n      endpoint: `${BASE_URL}/webhook/spendguard-agent`,\n      payload: {\n        url: \"https://www.hs.fi/uutiset\",\n        title: \"HS News\",\n        event: \"site_visit\",\n        timestamp: new Date().toISOString(),\n      },\n      expected: {\n        page_type: \"non_shopping\",\n        should_nudge: false,\n      },\n    },\n  },\n\n  //\n  // 3) /smart-purchase-nudge – credit offer → caution verdict\n  //\n  {\n    json: {\n      name: \"Smart Nudge – Credit offer (should be CAUTION)\",\n      endpoint: `${BASE_URL}/webhook/smart-purchase-nudge`,\n      payload: {\n        url: \"https://example.com/credit-offer\",\n        title: \"0% Interest Credit!\",\n        price: 0,\n        cartTotal: 0,\n        monthlyBudget: 1200,\n      },\n      expected: {\n        verdict: \"caution\",\n      },\n    },\n  },\n\n  //\n  // 4) /spendguard-agent – Zalando home → shopping, should nudge\n  //\n  {\n    json: {\n      name: \"SpendGuard – Zalando home (shopping, should nudge)\",\n      endpoint: `${BASE_URL}/webhook/spendguard-agent`,\n      payload: {\n        url: \"https://www.zalando.fi/\",\n        title: \"Zalando – Fashion Online\",\n        event: \"site_visit\",\n        timestamp: new Date().toISOString(),\n      },\n      expected: {\n        page_type: \"shopping\",\n        should_nudge: true,\n      },\n    },\n  },\n\n  //\n  // 5) /swipewise-agent – malformed body → safe UNKNOWN + error\n  //\n  {\n    json: {\n      name: \"SwipeWise Agent – Malformed body (safe error)\",\n      endpoint: `${BASE_URL}/webhook/swipewise-agent`,\n      // ✅ Valid JSON object, but body is a wrong *type* (string)\n      payload: {\n        body: \"not a JSON object\",\n      },\n      expected: {\n        route: \"UNKNOWN\",\n        error: true,\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        4128
+      ],
+      "id": "cb1b724f-b3c4-45c8-bafb-a0c7595cdf7a",
+      "name": "Set Test Cases"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json[\"endpoint\"]}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json[\"payload\"] }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        16,
+        4128
+      ],
+      "id": "b9b16190-cbcd-4775-89f2-c452418466fb",
+      "name": "Run Test"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: Compare Expected vs Actual\n\nconst testDefs = $items(\"Set Test Cases\"); // original { name, expected, ... }\nconst responses = $items(\"Run Test\");      // HTTP responses\n\nconst results = [];\n\nfor (let i = 0; i < testDefs.length; i++) {\n  const def = testDefs[i].json;\n  const resp = responses[i]?.json ?? {};\n\n  const { name, expected } = def;\n  let passed = true;\n  const details = [];\n\n  function checkField(fieldName) {\n    if (typeof expected?.[fieldName] === \"undefined\") return;\n    const actual = resp[fieldName];\n    const exp = expected[fieldName];\n    if (actual !== exp) {\n      passed = false;\n      details.push(`${fieldName}: expected \"${exp}\", got \"${actual}\"`);\n    }\n  }\n\n  // Existing checks\n  checkField(\"page_type\");\n  checkField(\"should_nudge\");\n  checkField(\"risk_level\");\n  checkField(\"verdict\");\n\n  // New: for agent / error scenario\n  checkField(\"route\");\n  checkField(\"error\");\n\n  results.push({\n    json: {\n      name,\n      expected,\n      actual: resp,\n      passed,\n      details: details.length\n        ? details.join(\"; \")\n        : \"All expected fields matched.\",\n    },\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        4128
+      ],
+      "id": "b47eee86-deb4-4fa0-8746-28564665fdca",
+      "name": "Compare Expected vs Actual"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all eval results into one metrics object\n\nconst items = $items(); // all items from Compare Expected vs Actual\n\nconst total = items.length;\nconst passed = items.filter(i => i.json.passed).length;\nconst failed = total - passed;\n\nreturn [\n  {\n    json: {\n      total,\n      passed,\n      failed,\n      passRate: total > 0 ? (passed / total) * 100 : 0,\n      cases: items.map(i => i.json),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        4128
+      ],
+      "id": "6dcdfff0-f428-48da-a8ad-5cfad41862b9",
+      "name": "Aggregate Metrics"
+    },
+    {
+      "parameters": {
+        "content": "## 🧠 SwipeWise Agent — Architecture Overview\nThis workflow acts as a context-aware financial behavior agent.  \nIncoming browser events (page visits, actions, or offer details) are routed\nto the appropriate internal “tools,” which include:\n\n• page classification  \n• financial-offer risk analysis  \n• structured advice generation  \n• optional creative generation for marketing context  \n• HTML rendering for a clean, friendly UI\n\nThe agent keeps only the minimum context needed for each step and uses\ndeterministic fallbacks to ensure consistent outputs, even on ambiguous inputs\nor malformed model responses.\n\nA compact eval harness with several test scenarios is included, allowing\nquick verification of expected behavior across different page types,\noffer structures, and edge cases.\n\nThe workflow is organized to be reproducible, modular, and suitable for\ndemoing end-to-end agent decisions—from raw browser signals to final\nnudges or analysis cards.",
+        "height": 496,
+        "width": 566
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1696,
+        1248
+      ],
+      "typeVersion": 1,
+      "id": "9828a9bb-ceaf-4f06-b806-9ea186bc83d8",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "## 🔧 Setup Instructions (Template Users)\n\n1. This workflow requires no local database.\n2. Add your OpenAI credential under \"OpenAI Chat Model\" nodes.\n3. Optional: Update the “smart-purchase-nudge” endpoint if deploying elsewhere.\n4. Browser extension can POST:\n   - page visits → /spendguard-agent\n   - offer details → /smart-purchase-nudge\n   - analysis viewer → /swipewise-deal-view\n5. Everything else is self-contained and runs immediately.\n\n",
+        "height": 352,
+        "width": 432
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1648,
+        2128
+      ],
+      "typeVersion": 1,
+      "id": "b3c063cf-b16b-482b-b171-9a5ec2d0e561",
+      "name": "Sticky Note7"
+    },
+    {
+      "parameters": {
+        "content": "##🤖 Agent Behavior\n\nIncoming signals are handled agentically:\n1. Classify context: shopping, checkout, ad, or general browsing.\n2. Choose the correct sub-flow:\n   - Page classification → Behavioral nudge\n   - Offer details → Financial analysis\n   - Ad creative → Visual generator\n3. Apply tool-specific logic, LLM calls, and deterministic safety rules.\n4. Return structured JSON back to extension/UI.\n\nAgent only keeps the context necessary for the current decision.\nEverything else is dropped to stay fast and reliable.",
+        "height": 336,
+        "width": 512
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1664,
+        2544
+      ],
+      "typeVersion": 1,
+      "id": "a2cf9812-ae29-4d54-880a-9b6a379a8da8",
+      "name": "Sticky Note8"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "swipewise-agent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "444e99a6-2d27-44a3-a21e-9af871317e51",
+      "name": "Webhook – SwipeWise Agent",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -464,
+        1584
+      ],
+      "webhookId": "3703108d-4e5f-4e5e-b847-61de35659fff"
+    },
+    {
+      "parameters": {
+        "jsCode": "let body = $json.body ?? $json;\n\nif (typeof body === \"string\") {\n  try {\n    body = JSON.parse(body);\n  } catch (err) {\n    // malformed JSON → send fallback\n    return [\n      {\n        json: {\n          route: \"UNKNOWN\",\n          payload: {},\n          error: true,\n          message: \"Malformed JSON in request body\"\n        }\n      }\n    ];\n  }\n}\n\nconst eventType = String(body.eventType || '').trim();\n\n// Normalize type\nlet route = 'UNKNOWN';\n\nif (eventType === 'page_visit') route = 'PAGE_CLASSIFIER';\nelse if (eventType === 'offer_analysis') route = 'OFFER_ANALYZER';\nelse if (eventType === 'ad_card') route = 'AD_GENERATOR';\n\nreturn [\n  {\n    json: {\n      route,\n      payload: body,   // ALWAYS an object now\n    },\n  },\n];"
+      },
+      "id": "22ea2bfb-42b5-4fe0-8870-4f1f3443a081",
+      "name": "Brain – Route Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        1584
+      ]
+    },
+    {
+      "parameters": {
+        "value1": "={{$json.route}}",
+        "rules": {
+          "rules": [
+            {
+              "operation": "equal",
+              "value2": "=PAGE_CLASSIFIER"
+            },
+            {
+              "operation": "equal",
+              "value2": "=OFFER_ANALYZER",
+              "output": 1
+            },
+            {
+              "operation": "equal",
+              "value2": "=AD_GENERATOR",
+              "output": 2
+            },
+            {
+              "operation": "equal",
+              "value2": "=UNKNOWN",
+              "output": 3
+            }
+          ]
+        }
+      },
+      "id": "d1e885f3-ee02-4edd-842f-1aaea7074dd3",
+      "name": "Switch – Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        128,
+        1584
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://mghackaton.app.n8n.cloud/webhook/spendguard-agent",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.payload}}",
+        "options": {}
+      },
+      "id": "9f217a44-414f-4a60-9ef1-747c0f61c385",
+      "name": "Call Page Classifier",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        432,
+        1376
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://mghackaton.app.n8n.cloud/webhook/smart-purchase-nudge",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.payload}}",
+        "options": {}
+      },
+      "id": "e47a3220-e205-44a8-a699-df5034043d6a",
+      "name": "Call Offer Analyzer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        432,
+        1584
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://mghackaton.app.n8n.cloud/webhook/ad-card-llm",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.payload}}",
+        "options": {}
+      },
+      "id": "1ef43453-c591-431e-85e1-f20d81accf0e",
+      "name": "Call Ad Visual Generator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        432,
+        1776
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## 🧠 SwipeWise Agent Brain\n\nThis block is the central decision-maker for all incoming browser events.\nIt receives a single unified payload from the extension and routes it to the correct internal tool.\n\nHow it works\n\t1.\tNormalize event → route\n\t•\tpage_visit → PAGE_CLASSIFIER\n\t•\toffer_analysis → OFFER_ANALYZER\n\t•\tad_card → AD_GENERATOR\n\t2.\tSwitch – Route\n\t•\tUses {{$json.route}} to activate only one branch\n\t•\tOutput 0 → Page classifier (nudges for shopping/checkouts)\n\t•\tOutput 1 → Offer analyzer (risk analysis for financial offers)\n\t•\tOutput 2 → Ad generator (AI visual creative for offers)\n\nPurpose\n\nThis “brain” gives SwipeWise:\n\t•\tModular tool selection\n\t•\tConsistent input shape\n\t•\tNo unnecessary LLM calls\n\t•\tClean routing logic\n\t•\tA single webhook for the entire agent\n\nNotes\n\t•\tThe brain returns whatever the selected branch returns.\n\t•\tNo state is carried between calls → fast, predictable, deterministic.\n\t•\tDesigned for browser extensions, low latency, and agentic workflows.",
+        "height": 864,
+        "width": 2064,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -992,
+        1248
+      ],
+      "typeVersion": 1,
+      "id": "29947761-99a9-4af7-9613-13e5315b2272",
+      "name": "Sticky Note9"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { route, payload } = $json;\n\nreturn [\n  {\n    json: {\n      error: true,\n      message:\n        'Unsupported eventType for SwipeWise agent. Use eventType = \"page_visit\" | \"offer_analysis\" | \"ad_card\".',\n      route: route || 'UNKNOWN',\n      receivedPayload: payload || $json\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        1952
+      ],
+      "id": "ddbfd894-cc64-4e98-8a73-db46bbbb8f22",
+      "name": "Fallback"
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "prompt": "={{ $json.imagePrompt }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2,
+      "position": [
+        416,
+        3616
+      ],
+      "id": "1a7ff792-f9a7-46b5-9c15-f1e78188e344",
+      "name": "Generate an image",
+      "credentials": {
+        "openAiApi": {
+          "id": "PQwogquGqqr5QT9y",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $json;\n\nif (resp.error || resp.statusCode >= 400) {\n  return [\n    {\n      json: {\n        error: true,\n        message: \"Internal tool failed, using safe fallback.\",\n        page_type: \"non_shopping\",\n        should_nudge: false,\n        risk_level: \"low\",\n      },\n    },\n  ];\n}\n\nreturn [{ json: resp }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        1616
+      ],
+      "id": "7c1084ac-68eb-410c-84d9-5e9e8e58204f",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "content": "## SwipeWise – Smart Purchase Nudge & Deal View\n\nClassifies browsing events as shopping/checkout and sends calm nudges, analyzes specific purchase offers with an LLM, and renders a SwipeWise HTML card for a browser extension popup.",
+        "height": 224,
+        "width": 368
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1616,
+        1824
+      ],
+      "typeVersion": 1,
+      "id": "e351352d-6583-4f0a-a58f-d1a928563529",
+      "name": "Sticky Note2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook – Classify Page Visit": {
+      "main": [
+        [
+          {
+            "node": "LLM – Classify Page Visit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM – Classify Page Visit": {
+      "main": [
+        [
+          {
+            "node": "Normalize Page Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Language Model – Page Classifier": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "LLM – Classify Page Visit",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Page Classification": {
+      "main": [
+        [
+          {
+            "node": "Build Classifier Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook – Smart Purchase Nudge (API)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Offer Text For LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Offer Text For LLM": {
+      "main": [
+        [
+          {
+            "node": "LLM – Analyze Offer Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM – Analyze Offer Risk": {
+      "main": [
+        [
+          {
+            "node": "Format Offer Analysis For Extension",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Language Model – Offer Analyzer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "LLM – Analyze Offer Risk",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook – SwipeWise Deal View (HTML)": {
+      "main": [
+        [
+          {
+            "node": "Parse Query Params → Offer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Query Params → Offer": {
+      "main": [
+        [
+          {
+            "node": "Call Smart Purchase Nudge API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Smart Purchase Nudge API": {
+      "main": [
+        [
+          {
+            "node": "Map Offer Analysis → View Model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Offer Analysis → View Model": {
+      "main": [
+        [
+          {
+            "node": "Render SwipeWise HTML Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render SwipeWise HTML Card": {
+      "main": [
+        [
+          {
+            "node": "Respond With HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook – Generate Ad Creative": {
+      "main": [
+        [
+          {
+            "node": "LLM – Design Ad Visual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM – Design Ad Visual": {
+      "main": [
+        [
+          {
+            "node": "Parse Ad Design JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Language Model – Ad Designer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "LLM – Design Ad Visual",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Ad Design JSON": {
+      "main": [
+        [
+          {
+            "node": "Generate an image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Eval": {
+      "main": [
+        [
+          {
+            "node": "Set Test Cases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Test Cases": {
+      "main": [
+        [
+          {
+            "node": "Run Test",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Test": {
+      "main": [
+        [
+          {
+            "node": "Compare Expected vs Actual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare Expected vs Actual": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook – SwipeWise Agent": {
+      "main": [
+        [
+          {
+            "node": "Brain – Route Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Brain – Route Event": {
+      "main": [
+        [
+          {
+            "node": "Switch – Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch – Route": {
+      "main": [
+        [
+          {
+            "node": "Call Page Classifier",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call Offer Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call Ad Visual Generator",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate an image": {
+      "main": [
+        [
+          {
+            "node": "Build Final Ad JSON For Frontend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Page Classifier": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Offer Analyzer": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Ad Visual Generator": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "6474e222-2da2-4c24-87dd-f4b412b7712b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8d116b92d51947f1f9904dd6d69f8f252af7816f81d50c41f62a5878cbcf4365"
+  },
+  "id": "QKTkqso67lNMcSAW",
+  "tags": []
+}
